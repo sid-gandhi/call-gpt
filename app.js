@@ -1,38 +1,68 @@
-require('dotenv').config();
-require('colors');
+require("dotenv").config();
+require("colors");
 
-const express = require('express');
-const ExpressWs = require('express-ws');
+const express = require("express");
+const ExpressWs = require("express-ws");
 
-const { GptService } = require('./services/gpt-service');
-const { StreamService } = require('./services/stream-service');
-const { TranscriptionService } = require('./services/transcription-service');
-const { TextToSpeechService } = require('./services/tts-service');
-const { recordingService } = require('./services/recording-service');
+const { GptService } = require("./services/gpt-service");
+const { StreamService } = require("./services/stream-service");
+const { TranscriptionService } = require("./services/transcription-service");
+const { TextToSpeechService } = require("./services/tts-service");
+const { recordingService } = require("./services/recording-service");
 
-const VoiceResponse = require('twilio').twiml.VoiceResponse;
+const VoiceResponse = require("twilio").twiml.VoiceResponse;
 
 const app = express();
 ExpressWs(app);
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 const PORT = process.env.PORT || 3000;
 
-app.post('/incoming', (req, res) => {
+app.post("/incoming", (req, res) => {
   try {
     const response = new VoiceResponse();
     const connect = response.connect();
     connect.stream({ url: `wss://${process.env.SERVER}/connection` });
-  
-    res.type('text/xml');
+
+    res.type("text/xml");
     res.end(response.toString());
   } catch (err) {
     console.log(err);
   }
 });
 
-app.ws('/connection', (ws) => {
+app.post("/call/outbound", async (req, res) => {
   try {
-    ws.on('error', console.error);
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+    const client = require("twilio")(accountSid, authToken);
+
+    console.log(req.body);
+
+    const toNumber = req.body.to_number;
+
+    console.log(`Making outbound call to ${toNumber}`.red);
+
+    const call = await client.calls.create({
+      url: `https://${process.env.SERVER}/incoming`,
+      to: toNumber,
+      from: process.env.FROM_NUMBER,
+    });
+
+    console.log(`Outbound call initiated: ${call.sid}`.red);
+
+    return res.status(200).json({ callSid: call.sid });
+  } catch (err) {
+    console.log(err?.message);
+  }
+});
+
+app.ws("/connection", (ws) => {
+  try {
+    ws.on("error", console.error);
     // Filled in from start message
     let streamSid;
     let callSid;
@@ -41,68 +71,84 @@ app.ws('/connection', (ws) => {
     const streamService = new StreamService(ws);
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
-  
+
     let marks = [];
     let interactionCount = 0;
-  
+
     // Incoming from MediaStream
-    ws.on('message', function message(data) {
+    ws.on("message", function message(data) {
       const msg = JSON.parse(data);
-      if (msg.event === 'start') {
+      if (msg.event === "start") {
         streamSid = msg.start.streamSid;
         callSid = msg.start.callSid;
-        
+
         streamService.setStreamSid(streamSid);
         gptService.setCallSid(callSid);
 
         // Set RECORDING_ENABLED='true' in .env to record calls
         recordingService(ttsService, callSid).then(() => {
-          console.log(`Twilio -> Starting Media Stream for ${streamSid}`.underline.red);
-          ttsService.generate({partialResponseIndex: null, partialResponse: 'Hello! I understand you\'re looking for a pair of AirPods, is that correct?'}, 0);
+          console.log(
+            `Twilio -> Starting Media Stream for ${streamSid}`.underline.red
+          );
+          ttsService.generate(
+            {
+              partialResponseIndex: null,
+              partialResponse: `Hello! I understand you're looking advice on investing in the stock market. How can I help you today?`,
+            },
+            0
+          );
         });
-      } else if (msg.event === 'media') {
+      } else if (msg.event === "media") {
         transcriptionService.send(msg.media.payload);
-      } else if (msg.event === 'mark') {
+      } else if (msg.event === "mark") {
         const label = msg.mark.name;
-        console.log(`Twilio -> Audio completed mark (${msg.sequenceNumber}): ${label}`.red);
-        marks = marks.filter(m => m !== msg.mark.name);
-      } else if (msg.event === 'stop') {
+        console.log(
+          `Twilio -> Audio completed mark (${msg.sequenceNumber}): ${label}`.red
+        );
+        marks = marks.filter((m) => m !== msg.mark.name);
+      } else if (msg.event === "stop") {
         console.log(`Twilio -> Media stream ${streamSid} ended.`.underline.red);
       }
     });
-  
-    transcriptionService.on('utterance', async (text) => {
+
+    transcriptionService.on("utterance", async (text) => {
       // This is a bit of a hack to filter out empty utterances
-      if(marks.length > 0 && text?.length > 5) {
-        console.log('Twilio -> Interruption, Clearing stream'.red);
+      if (marks.length > 0 && text?.length > 5) {
+        console.log("Twilio -> Interruption, Clearing stream".red);
         ws.send(
           JSON.stringify({
             streamSid,
-            event: 'clear',
+            event: "clear",
           })
         );
       }
     });
-  
-    transcriptionService.on('transcription', async (text) => {
-      if (!text) { return; }
-      console.log(`Interaction ${interactionCount} – STT -> GPT: ${text}`.yellow);
+
+    transcriptionService.on("transcription", async (text) => {
+      if (!text) {
+        return;
+      }
+      console.log(
+        `Interaction ${interactionCount} – STT -> GPT: ${text}`.yellow
+      );
       gptService.completion(text, interactionCount);
       interactionCount += 1;
     });
-    
-    gptService.on('gptreply', async (gptReply, icount) => {
-      console.log(`Interaction ${icount}: GPT -> TTS: ${gptReply.partialResponse}`.green );
+
+    gptService.on("gptreply", async (gptReply, icount) => {
+      console.log(
+        `Interaction ${icount}: GPT -> TTS: ${gptReply.partialResponse}`.green
+      );
       ttsService.generate(gptReply, icount);
     });
-  
-    ttsService.on('speech', (responseIndex, audio, label, icount) => {
+
+    ttsService.on("speech", (responseIndex, audio, label, icount) => {
       console.log(`Interaction ${icount}: TTS -> TWILIO: ${label}`.blue);
-  
+
       streamService.buffer(responseIndex, audio);
     });
-  
-    streamService.on('audiosent', (markLabel) => {
+
+    streamService.on("audiosent", (markLabel) => {
       marks.push(markLabel);
     });
   } catch (err) {
